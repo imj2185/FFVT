@@ -13,6 +13,7 @@ import timeit
 
 import torch
 import torch.distributed as dist
+import torchprofile
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
