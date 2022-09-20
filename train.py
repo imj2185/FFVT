@@ -9,6 +9,7 @@ import numpy as np
 
 from datetime import timedelta
 import time
+import timeit
 
 import torch
 import torch.distributed as dist
@@ -301,6 +302,28 @@ def train(args, model):
     logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
     logger.info("End Training!")
 
+def latency(args, model, test_loader):
+    # Validation!
+    eval_losses = AverageMeter()
+
+    model.eval()
+    all_preds, all_label = [], []
+    epoch_iterator = tqdm(test_loader,
+                          desc="Validating... (loss=X.X)",
+                          bar_format="{l_bar}{r_bar}",
+                          dynamic_ncols=True,
+                          disable=args.local_rank not in [-1, 0])
+    loss_fct = torch.nn.CrossEntropyLoss()
+    start_time = timeit.default_timer()
+    for step, batch in enumerate(epoch_iterator):
+        batch = tuple(t.to(args.device) for t in batch)
+        x, y = batch
+        with torch.no_grad():
+            logits = model(x)
+    evalTime = timeit.default_timer() - start_time
+
+    return evalTime
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -365,6 +388,11 @@ def main():
     parser.add_argument('--data_root', type=str, default='./data')
     parser.add_argument('--smoothing_value', type=float, default=0.0,
                         help="Label smoothing value\n")
+
+    parser.add_argument("--do_lat_mem_measure", action="store_true", 
+                        help="do evo search")
+    parser.add_argument("--do_mac", action="store_true", 
+                        help="do evo search")
     
     args = parser.parse_args()
     args.data_root = '{}/{}'.format(args.data_root, args.dataset)
@@ -396,7 +424,47 @@ def main():
     args, model = setup(args)
 
     # Training
-    train(args, model)
+    #train(args, model)
+    if args.do_lat_mem_measure:
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        _, test_loader = get_loader(args)
+        from pytorch_memlab import MemReporter
+        size = (8, 3, args.img_size, args.img_size)
+        dummy_inputs = (
+            torch.ones(size, dtype=torch.float).to(args.device)
+        )
+
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+
+        size_all_mb = (param_size + buffer_size) / 1024**2
+        print('model size: {:.3f}MB'.format(size_all_mb))
+
+        reporter = MemReporter(model)
+        output = model(dummy_inputs)
+        reporter.report()
+
+        # mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        # print("MACs: ", mac)
+        
+        evalTime = latency(args, model, test_loader)
+        print('Evaluation done in total {:.3f} secs ({:.3f} sec per example)'.format(evalTime, evalTime / len(test_loader)))
+
+    if args.do_mac:
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        _, test_loader = get_loader(args)
+        size = (8, 3, args.img_size, args.img_size)
+        dummy_inputs = (
+            torch.ones(size, dtype=torch.float).to(args.device)
+        )
+        mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        print("MACs: ", mac)
 
 
 if __name__ == "__main__":
